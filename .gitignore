@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+CLAUDE.md
+/demo/
+runs/
+*.egg-info/
+.claude/
+.codex/
+example_autodl.py
+.pytest_cache/

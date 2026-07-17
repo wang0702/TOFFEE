@@ -1,0 +1,4 @@
+numpy>=1.24
+openai>=1.40
+httpx>=0.27
+openpyxl>=3.1

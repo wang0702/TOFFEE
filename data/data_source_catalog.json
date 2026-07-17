@@ -1,0 +1,11 @@
+{
+  "sources": [
+    {
+      "source_id": "demo_sales",
+      "source_group": "demo",
+      "benchmark": "demo",
+      "data_file": "data/demo/orders.csv",
+      "extra_sources": ["data/demo/marketing.csv", "data/demo/returns.csv"]
+    }
+  ]
+}
