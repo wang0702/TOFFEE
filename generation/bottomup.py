@@ -16,6 +16,7 @@ from toffee.client.openrouter import OpenRouterClient
 from toffee.config import (
     ADMISSION_REPLAY,
     B_SKEL_BASE,
+    BRIDGE_MAX,
     MAX_UNITS_PER_ENV,
     MODELS,
     N_FORMATS,
@@ -67,7 +68,6 @@ class Hierarchy:
 
 
 @dataclass
-@dataclass
 class TaskPackage:
     x: str
     path: List[str]
@@ -105,6 +105,18 @@ class SynthesizedTask:
     answer_key: str = ""
     answer_key_rows: List[Dict[str, Any]] = field(default_factory=list)
     provenance: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class AnswerContract:
+    """One executable source of truth for a synthesized task."""
+    exec_db: str
+    query_sql: str
+    display_sql: str
+    target_clause: str
+    key_rows: List[Dict[str, Any]]
+    key_stdout: str
+    required_units: List[str]
 
 
 def _fingerprint(s: str) -> str:
@@ -204,13 +216,14 @@ def _probe_unit_association(u: SourceUnit) -> List[Tuple[str, Dict[str, Any]]]:
     nums = [c for c, t, _ in u.sch if _is_num_type(t)]
     if len(cats) >= 1 and len(nums) >= 1:
         c, n = cats[0], nums[0]
-        q = (f'SELECT "{c}", AVG("{n}") AS avg_v, COUNT(*) AS k '
+        q = (f'SELECT "{c}", AVG("{n}") AS avg_v '
              f'FROM "{u.logical_table}" WHERE "{c}" IS NOT NULL AND "{n}" IS NOT NULL '
              f'GROUP BY "{c}" ORDER BY avg_v DESC LIMIT 10;')
         out.append((q, {"tables_used": [u.logical_table], "col_used": [c, n]}))
     elif len(cats) >= 2:
         c1, c2 = cats[0], cats[1]
-        q = (f'SELECT "{c1}", "{c2}", COUNT(*) AS n FROM "{u.logical_table}" '
+        q = (f'SELECT CAST("{c1}" AS TEXT) || \' / \' || CAST("{c2}" AS TEXT) '
+             f'AS label, COUNT(*) AS n FROM "{u.logical_table}" '
              f'WHERE "{c1}" IS NOT NULL AND "{c2}" IS NOT NULL '
              f'GROUP BY "{c1}", "{c2}" ORDER BY n DESC LIMIT 10;')
         out.append((q, {"tables_used": [u.logical_table], "col_used": [c1, c2]}))
@@ -324,12 +337,19 @@ def _sources_of_path(H: Hierarchy, anchor_tuple: Tuple[Anchor, ...]) -> List[str
 def _admit_stable(H: Hierarchy, anchor_tuple: Tuple[Anchor, ...]) -> bool:
     for a in anchor_tuple:
         exec_db = a.c.get("exec_db") or H.units[a.U_a[0]].db_path
-        res = execute_sql(exec_db, a.q_probe)
+        replay_sql = str(a.c.get("stable_sql") or a.q_probe)
+        expected_signature = str(
+            a.c.get("stable_signature") or a.r_signature
+        )
+        expected_lines = int(
+            a.c.get("stable_line_count", a.r.count("\n"))
+        )
+        res = execute_sql(exec_db, replay_sql)
         if not res.success:
             return False
-        if abs(res.stdout.count("\n") - a.r.count("\n")) > 2:
+        if abs(res.stdout.count("\n") - expected_lines) > 2:
             return False
-        if _fingerprint(res.stdout) != a.r_signature:
+        if _fingerprint(res.stdout) != expected_signature:
             return False
     return True
 
@@ -468,7 +488,8 @@ def _admit_solvable(
         if steps >= b_skel:
             return False
         exec_db = a.c.get("exec_db") or H.units[a.U_a[0]].db_path
-        res = execute_sql(exec_db, a.q_probe)
+        replay_sql = str(a.c.get("stable_sql") or a.q_probe)
+        res = execute_sql(exec_db, replay_sql)
         steps += 1
         if not res.success or not res.stdout.strip():
             return False
@@ -542,9 +563,53 @@ def _parse_llm_json(content: str) -> Optional[Dict[str, str]]:
         return None
 
 
+def _qident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _sql_body(sql: str) -> str:
+    return (sql or "").strip().rstrip(";").strip()
+
+
+def _teacher_sql_view(sql: str) -> str:
+    """Return a query view with data literals and file paths removed."""
+    view = re.sub(r"'(?:''|[^'])*'", "'<value>'", sql or "")
+    view = re.sub(
+        r"\bIN\s*\((?!\s*SELECT\b)[^)]*\)", "IN (<values>)", view,
+        flags=re.IGNORECASE,
+    )
+    view = re.sub(
+        r"(?<![\w.])[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?![\w.])",
+        "<number>", view,
+    )
+    return view
+
+
+def _humanize_identifier(name: str) -> str:
+    text = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(name or ""))
+    text = re.sub(r"[_\-]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip().lower()
+
+
+def _probe_target_clause(u: SourceUnit, sql: str, meta: Dict[str, Any]) -> str:
+    cols = list((meta or {}).get("col_used") or [])
+    first = _humanize_identifier(cols[0]) if cols else "group"
+    second = _humanize_identifier(cols[1]) if len(cols) > 1 else "records"
+    low = (sql or "").lower()
+    if "avg(" in low:
+        return f"report the average {second} for every {first}"
+    if "sum(" in low:
+        return f"report the total {second} for every {first}"
+    if len(cols) >= 2 and "||" in low:
+        return f"report the record count for every {first} and {second} pair"
+    return f"report the record count for every {first}"
+
+
 def _mk_path_anchor(
     sql: str, exec_db: str, unit_ids: List[str], category: str,
-    units_by_id: Dict[str, SourceUnit],
+    units_by_id: Dict[str, SourceUnit], *, answer_sql: Optional[str] = None,
+    display_sql: Optional[str] = None, target_clause: str = "",
+    composed: bool = False,
 ) -> Optional[Anchor]:
     res = execute_sql(exec_db, sql)
     if not res.success or not res.stdout.strip():
@@ -552,23 +617,79 @@ def _mk_path_anchor(
     tables = [units_by_id[u].logical_table for u in unit_ids if u in units_by_id]
     _keep, rowcount, variance = _nontrivial(res.stdout)
     a_id = "a_" + hashlib.sha1(sql.encode()).hexdigest()[:10]
+    contract_meta = {
+        "exec_db": exec_db,
+        "category": category,
+        "tables_used": tables,
+        "answer_sql": answer_sql or sql,
+        "display_sql": display_sql or _teacher_sql_view(sql),
+        "target_clause": target_clause,
+        "composed": composed,
+    }
     return Anchor(
         a_id=a_id, q_probe=sql, r=res.stdout[:2000], r_rowcount=rowcount,
         r_signature=_fingerprint(res.stdout),
-        c={"exec_db": exec_db, "category": category, "tables_used": tables},
+        c=contract_meta,
         U_a=unit_ids, scope_id="g00", category=category, numeric_variance=variance,
     )
 
 
+def _chain_queries(
+    edge, units_by_id: Dict[str, SourceUnit],
+) -> Optional[Tuple[str, str, str, str]]:
+    src = units_by_id.get(edge.src)
+    dst = units_by_id.get(edge.dst)
+    if not src or not dst or src.db_path != dst.db_path:
+        return None
+    probe = _sql_body(edge.meta.get("probe_sql", ""))
+    bridge_col = edge.meta.get("bridge_col")
+    target_col = edge.meta.get("target_col")
+    if not probe or not bridge_col or not target_col:
+        return None
+    prefix = (
+        f"WITH bridge AS ({probe}) "
+        f"SELECT t.{_qident(target_col)} AS {_qident(target_col)}, "
+        f"COUNT(*) AS matching_rows FROM {_qident(dst.logical_table)} AS t "
+        f"JOIN bridge AS b ON t.{_qident(target_col)} = b.{_qident(bridge_col)} "
+        f"GROUP BY t.{_qident(target_col)} "
+        f"ORDER BY matching_rows DESC, t.{_qident(target_col)}"
+    )
+    run_sql = prefix + " LIMIT 20;"
+    answer_sql = prefix + ";"
+    target = (
+        f"report the matching {dst.title} row count for every group selected "
+        "by the upstream computation"
+    )
+    return run_sql, answer_sql, _teacher_sql_view(run_sql), target
+
+
 def _execute_edge(edge, units_by_id: Dict[str, SourceUnit]) -> Optional[List[Anchor]]:
     if edge.kind == "join":
+        src, dst = units_by_id.get(edge.src), units_by_id.get(edge.dst)
+        if not src or not dst:
+            return None
+        target = "report the matching row count for every shared group"
         a = _mk_path_anchor(edge.meta["join_sql"], edge.meta["exec_db"],
-                            [edge.src, edge.dst], "join", units_by_id)
+                            [edge.src, edge.dst], "join", units_by_id,
+                            answer_sql=_strip_row_cap(edge.meta["join_sql"]),
+                            target_clause=target)
         return [a] if a else None
+    compiled = _chain_queries(edge, units_by_id)
+    if compiled is None:
+        return None
+    run_sql, answer_sql, display_sql, target = compiled
+    src = units_by_id[edge.src]
+    probe_meta = dict(edge.meta.get("probe_meta") or {})
     probe = _mk_path_anchor(edge.meta["probe_sql"], edge.meta["probe_exec_db"],
-                            [edge.src], "probe", units_by_id)
-    verify = _mk_path_anchor(edge.meta["verify_sql"], edge.meta["verify_exec_db"],
-                             [edge.dst], "chain", units_by_id)
+                            [edge.src], "probe", units_by_id,
+                            answer_sql=_strip_row_cap(edge.meta["probe_sql"]),
+                            target_clause=_probe_target_clause(
+                                src, edge.meta["probe_sql"], probe_meta))
+    verify = _mk_path_anchor(
+        run_sql, src.db_path, [edge.src, edge.dst], "chain", units_by_id,
+        answer_sql=answer_sql, display_sql=display_sql, target_clause=target,
+        composed=True,
+    )
     if not probe or not verify:
         return None
     return [probe, verify]
@@ -631,6 +752,10 @@ def _provenance_from_anchors(anchors: Sequence[Anchor]) -> List[Dict[str, Any]]:
         facts.append({
             "anchor": a.a_id,
             "tables": list(a.c.get("tables_used", [])),
+            "unit_ids": list(a.U_a),
+            "query": str(a.c.get("display_sql") or _teacher_sql_view(a.q_probe)),
+            "depends_on": list(a.c.get("tables_used", [])),
+            "composed": bool(a.c.get("composed")),
             "nums": _extract_numbers(a.r)[:12],
             "labels": _labels_from_result(a.r),
             "rows": _rows_from_result(a.r),
@@ -657,21 +782,21 @@ def _key_rows_from_stdout(stdout: str) -> List[Dict[str, Any]]:
         _header, rows = parse_column_output(stdout or "")
     except Exception:
         return []
+    if len(_header) not in (1, 2):
+        return []
     out: List[Dict[str, Any]] = []
     for row in rows[:_KEY_ROW_CAP]:
-        label: Optional[str] = None
+        if not row:
+            continue
+        label: Optional[str] = str(row[0]).strip() or None
         value: Optional[float] = None
-        for cell in row:
-            cell = (cell or "").strip()
-            if not cell:
-                continue
+        if len(_header) == 2:
+            if len(row) < 2 or not str(row[1]).strip():
+                return []
             try:
-                v = float(cell.replace(",", ""))
-                if value is None:
-                    value = v
+                value = float(str(row[1]).strip().replace(",", ""))
             except ValueError:
-                if label is None and len(cell) <= 60:
-                    label = cell
+                return []
         if label is not None or value is not None:
             out.append({"label": label, "value": value,
                         "raw": " ".join(c.strip() for c in row if c.strip())})
@@ -693,7 +818,8 @@ def _compile_answer_key(
     final_anchor: Anchor, units_by_id: Dict[str, SourceUnit],
 ) -> Tuple[List[Dict[str, Any]], str]:
     exec_db = _final_exec_db(final_anchor, units_by_id)
-    capfree = _strip_row_cap(final_anchor.q_probe)
+    capfree = str(final_anchor.c.get("answer_sql") or
+                  _strip_row_cap(final_anchor.q_probe))
     stdout = final_anchor.r
     truncated = False
     if exec_db:
@@ -708,6 +834,34 @@ def _compile_answer_key(
     if truncated or len(rows) >= _KEY_ROW_CAP:
         return [], stdout
     return rows, stdout
+
+
+def _compile_answer_contract(
+    final_anchor: Anchor, units_by_id: Dict[str, SourceUnit],
+) -> Optional[AnswerContract]:
+    key_rows, key_stdout = _compile_answer_key(final_anchor, units_by_id)
+    if not key_rows:
+        return None
+    query_sql = str(final_anchor.c.get("answer_sql") or final_anchor.q_probe)
+    display_sql = str(final_anchor.c.get("display_sql") or
+                      _teacher_sql_view(query_sql))
+    target_clause = str(final_anchor.c.get("target_clause") or "").strip()
+    if not target_clause:
+        return None
+    # Admission must replay the same complete query that produced the key, not
+    # the row-limited construction preview stored in ``q_probe``.
+    final_anchor.c["stable_sql"] = query_sql
+    final_anchor.c["stable_signature"] = _fingerprint(key_stdout)
+    final_anchor.c["stable_line_count"] = key_stdout.count("\n")
+    return AnswerContract(
+        exec_db=_final_exec_db(final_anchor, units_by_id),
+        query_sql=query_sql,
+        display_sql=display_sql,
+        target_clause=target_clause,
+        key_rows=key_rows,
+        key_stdout=key_stdout,
+        required_units=list(dict.fromkeys(final_anchor.U_a)),
+    )
 
 
 _GUESSABLE_LABELS = {"yes", "no", "true", "false", "none", "null", "0", "1"}
@@ -726,7 +880,25 @@ def _key_guessable(key_rows: List[Dict[str, Any]]) -> bool:
     return bool(labels) and all(l in _GUESSABLE_LABELS for l in labels)
 
 
+def _hidden_key_values(key_rows: Sequence[Dict[str, Any]]) -> List[str]:
+    hidden: List[str] = []
+    for row in key_rows:
+        label = str(row.get("label") or "").strip()
+        if label:
+            hidden.append(label)
+        value = row.get("value")
+        if value is None:
+            continue
+        number = float(value)
+        hidden.append(str(number))
+        if number.is_integer():
+            hidden.append(str(int(number)))
+    return list(dict.fromkeys(hidden))
+
+
 def _margin_ok(final_anchor: Anchor, key_stdout: str) -> bool:
+    if final_anchor.c.get("composed"):
+        return True
     m = re.search(r"order\s+by\b.*\blimit\s+(\d+)", final_anchor.q_probe or "",
                   re.IGNORECASE | re.DOTALL)
     if not m:
@@ -747,30 +919,8 @@ def _applicable_question_types(path, anchors: Sequence[Anchor], graph) -> List[s
     final_rows = _rows_from_result(final.r)
     n_groups = sum(1 for r in final_rows if r.get("labels"))
     has_measure = any(r.get("nums") for r in final_rows)
-    measure_vals = [r["nums"][0] for r in final_rows if r.get("nums")]
-
     if has_measure and n_groups >= 2:
         fams.append("comparison")
-    if len(measure_vals) >= 2 and (max(measure_vals) - min(measure_vals)) > 0.0:
-        fams.append("anomaly")
-    if any(e.kind == "chain" for e in getattr(path, "edges", []) or []):
-        for a in anchors:
-            if a.category == "chain" and len(_rows_from_result(a.r)) >= 2:
-                fams.append("diagnosis")
-                break
-    dq = False
-    for uid in dict.fromkeys(getattr(path, "nodes", []) or []):
-        u = graph.units.get(uid)
-        if not u:
-            continue
-        for _col, st in (u.stat.get("cols", {}) or {}).items():
-            if float(st.get("null_rate", 0.0) or 0.0) > 0.0:
-                dq = True
-            if st.get("role") == "identifier" and 0.0 < float(
-                    st.get("distinct_ratio", 1.0) or 1.0) < 1.0:
-                dq = True
-    if dq:
-        fams.append("data_quality")
     if has_measure:
         fams.append("verification")
     return list(dict.fromkeys(fams))
@@ -812,6 +962,125 @@ def _hint_for_path(path, graph) -> Dict[str, Any]:
     return {"entry_units": entry_titles}
 
 
+def _join_endpoint_cols(edge) -> Optional[Tuple[str, str]]:
+    endpoints = dict(edge.meta.get("endpoint_cols") or {})
+    if edge.src in endpoints and edge.dst in endpoints:
+        return str(endpoints[edge.src]), str(endpoints[edge.dst])
+    pair = list(edge.meta.get("col_pair") or [])
+    if len(pair) == 2:
+        return str(pair[0]), str(pair[1])
+    return None
+
+
+def _level3_queries(
+    path, graph, empty_unit: Optional[str] = None,
+) -> Optional[Tuple[str, str, str, str, str]]:
+    """Compile A->B->C into one query whose terminal edge consumes a CTE."""
+    if path.level != 3 or len(path.nodes) != 3 or len(path.edges) != 2:
+        return None
+    if len(set(path.nodes)) != 3:
+        return None
+    first, terminal = path.edges
+    if terminal.kind != "chain" or first.dst != terminal.src:
+        return None
+    units = graph.units
+    if any(uid not in units for uid in path.nodes):
+        return None
+    a, b, c = (units[uid] for uid in path.nodes)
+    if len({a.db_path, b.db_path, c.db_path}) != 1:
+        return None
+
+    def table_ref(u: SourceUnit, alias: str) -> str:
+        table = _qident(u.logical_table)
+        if empty_unit == u.unit_id:
+            return f"(SELECT * FROM {table} WHERE 0) AS {alias}"
+        return f"{table} AS {alias}"
+
+    second_bridge = terminal.meta.get("bridge_col")
+    final_col = terminal.meta.get("target_col")
+    if not second_bridge or not final_col:
+        return None
+
+    ctes: List[str] = []
+    if first.kind == "join":
+        join_cols = _join_endpoint_cols(first)
+        if join_cols is None:
+            return None
+        a_col, b_col = join_cols
+        bridge_sql = (
+            f"SELECT b.{_qident(second_bridge)} AS k, COUNT(*) AS support "
+            f"FROM {table_ref(a, 'a')} JOIN {table_ref(b, 'b')} "
+            f"ON a.{_qident(a_col)} = b.{_qident(b_col)} "
+            f"WHERE b.{_qident(second_bridge)} IS NOT NULL "
+            f"GROUP BY b.{_qident(second_bridge)} "
+            f"ORDER BY support DESC, k LIMIT {BRIDGE_MAX}"
+        )
+    elif first.kind == "chain":
+        upstream_probe = _sql_body(first.meta.get("probe_sql", ""))
+        upstream_bridge = first.meta.get("bridge_col")
+        middle_col = first.meta.get("target_col")
+        if not upstream_probe or not upstream_bridge or not middle_col:
+            return None
+        if empty_unit == a.unit_id:
+            # Recompile the known probe against an empty view of A.  All probe
+            # templates name A once in their FROM clause.
+            table_pat = re.compile(
+                rf'(?i)(\bFROM\s+){re.escape(_qident(a.logical_table))}'
+            )
+            upstream_probe, n_sub = table_pat.subn(
+                rf'\1(SELECT * FROM {_qident(a.logical_table)} WHERE 0)',
+                upstream_probe, count=1,
+            )
+            if n_sub != 1:
+                return None
+        ctes.append(f"upstream AS ({upstream_probe})")
+        bridge_sql = (
+            f"SELECT b.{_qident(second_bridge)} AS k, COUNT(*) AS support "
+            f"FROM {table_ref(b, 'b')} JOIN upstream AS u "
+            f"ON b.{_qident(middle_col)} = u.{_qident(upstream_bridge)} "
+            f"WHERE b.{_qident(second_bridge)} IS NOT NULL "
+            f"GROUP BY b.{_qident(second_bridge)} "
+            f"ORDER BY support DESC, k LIMIT {BRIDGE_MAX}"
+        )
+    else:
+        return None
+
+    ctes.append(f"bridge AS ({bridge_sql})")
+    prefix = (
+        f"WITH {', '.join(ctes)} "
+        f"SELECT c.{_qident(final_col)} AS {_qident(final_col)}, "
+        f"COUNT(*) AS matching_rows FROM {table_ref(c, 'c')} "
+        f"JOIN bridge AS x ON c.{_qident(final_col)} = x.k "
+        f"GROUP BY c.{_qident(final_col)} "
+        f"ORDER BY matching_rows DESC, c.{_qident(final_col)}"
+    )
+    run_sql = prefix + " LIMIT 20;"
+    answer_sql = prefix + ";"
+    target = (
+        f"report the matching {c.title} row count for every group selected "
+        "by the preceding computation"
+    )
+    return a.db_path, run_sql, answer_sql, _teacher_sql_view(run_sql), target
+
+
+def _level3_source_dependence_ok(path, graph, normal_output: str) -> bool:
+    normal = "\n".join(line.rstrip() for line in normal_output.splitlines()).strip()
+    for uid in path.nodes:
+        compiled = _level3_queries(path, graph, empty_unit=uid)
+        if compiled is None:
+            return False
+        exec_db, run_sql, _answer_sql, _display_sql, _target = compiled
+        result = execute_sql(exec_db, run_sql)
+        if not result.success:
+            return False
+        changed = "\n".join(
+            line.rstrip() for line in result.stdout.splitlines()
+        ).strip()
+        if changed == normal:
+            return False
+    return True
+
+
 def _execute_path(path, graph) -> Optional[List[Anchor]]:
     units_by_id = graph.units
     if path.level == 1:
@@ -822,8 +1091,26 @@ def _execute_path(path, graph) -> Optional[List[Anchor]]:
         probe = _cheapest_probe(u)
         if not probe:
             return None
-        a = _mk_path_anchor(probe[0], u.db_path, [u.unit_id], "probe", units_by_id)
+        a = _mk_path_anchor(
+            probe[0], u.db_path, [u.unit_id], "probe", units_by_id,
+            answer_sql=_strip_row_cap(probe[0]),
+            target_clause=_probe_target_clause(u, probe[0], probe[1]),
+        )
         return [a] if a else None
+    if path.level == 3:
+        lead = _execute_edge(path.edges[0], units_by_id)
+        compiled = _level3_queries(path, graph)
+        if not lead or compiled is None:
+            return None
+        exec_db, run_sql, answer_sql, display_sql, target = compiled
+        final = _mk_path_anchor(
+            run_sql, exec_db, list(path.nodes), "composed", units_by_id,
+            answer_sql=answer_sql, display_sql=display_sql,
+            target_clause=target, composed=True,
+        )
+        if final is None or not _level3_source_dependence_ok(path, graph, final.r):
+            return None
+        return lead + [final]
     anchors: List[Anchor] = []
     for edge in path.edges:
         step = _execute_edge(edge, units_by_id)
@@ -845,17 +1132,32 @@ def _hierarchy_for_path(path, graph, anchors: List[Anchor]) -> Hierarchy:
 
 
 _TYPE_TEMPLATES: Dict[str, str] = {
-    "comparison": "Compare a quantitative measure across groups, periods, or "
-                  "sources and quantify the gap.",
-    "diagnosis": "Explain an observed change or outcome by locating the "
-                 "segment or factor that drives it.",
-    "verification": "Check a stated expectation against the data and "
-                    "quantify any discrepancy.",
-    "anomaly": "Find the segment, period, or record that deviates most from "
-               "the rest and size the deviation.",
-    "data_quality": "Assess missing, duplicated, or inconsistent values and "
-                    "quantify their extent or impact.",
+    "comparison": "Compare the same quantitative measure across the returned "
+                  "groups and report each value.",
+    "verification": "Report the computed measure so it can be checked against "
+                    "an operational expectation.",
 }
+
+
+_FRAMING_OPTIONS: Dict[str, Tuple[str, str]] = {
+    "operations_planning": ("the operations team", "operational planning"),
+    "resource_allocation": ("the planning team", "resource allocation"),
+    "performance_review": ("the management team", "a performance review"),
+    "risk_review": ("the risk team", "a risk review"),
+    "financial_review": ("the finance team", "a financial review"),
+    "program_review": ("the program team", "a program review"),
+    "policy_review": ("the policy team", "a policy review"),
+    "research_review": ("the research team", "a research review"),
+    "service_planning": ("the service team", "service planning"),
+    "quality_review": ("the quality team", "a quality review"),
+}
+
+
+def _framing_menu() -> str:
+    return "\n".join(
+        f"- {frame_id}: audience={audience}; decision={decision}"
+        for frame_id, (audience, decision) in _FRAMING_OPTIONS.items()
+    )
 
 _DEPGRAPH_REALIZE_PROMPT = """You are a senior analytics lead drafting a high-stakes question over a data environment.
 
@@ -863,44 +1165,35 @@ _DEPGRAPH_REALIZE_PROMPT = """You are a senior analytics lead drafting a high-st
 **Analysis path the answer must follow (structure only, intermediate values withheld):**
 {path_desc}
 
-**Final step of the path (result values withheld):**
+**Value-free query view (the authoritative query, with no result values):**
 {final_step}
+
+**Required analytical target:** {target_clause}
 
 **Tables on the path (name and columns):**
 {schema_blurb}
 
-Write ONE focused, deeply analytical question whose answer requires following
-the path above end to end. The path is multi-step by construction: an early
-result selects rows in a later table, so a one-shot lookup cannot answer it.
+Choose the ONE audience-and-decision frame below that best fits the fixed
+computation. You choose only a frame; the system writes the question and
+inserts the analytical target and source names itself.
+
+**Allowed frames (return the id exactly):**
+{framing_menu}
 
 Hard rules:
-- The question must ask for exactly the quantity the final step computes:
-  the same measure over the same grouping. Do NOT substitute a metric the
-  path does not compute (e.g., never ask about revenue when the final step
-  counts rows).
+- Do not write question text, background facts, values, or column names.
+- Do not add, restate, or replace the analytical target.
 - Do NOT mention any specific intermediate key value, id, code, or the final
   numeric answer. The bridge values that link the steps must be discovered by
   the analyst, never stated in the question.
-- Name the data sources the analyst should draw on (their table or file
-  names) naturally inside the question or context, the way a real request
-  names its data. Never name the columns that join or link them: finding
-  those is the analyst's job.
-- Commit to one quantitative target (rate, ratio, gap, share, growth,
-  concentration, etc.), not "investigate" or "explore".
-- Frame it around a concrete decision-maker facing a real operational choice.
-- Deliverable: ONE concise phrase, <= 30 words, one report shape and one
-  evidence type. No colon-lists, no "and also", no parenthetical sub-items.
 
-If no coherent {family} question fits this path -- the operation cannot be
+If no coherent {question_type} question fits this path -- the operation cannot be
 posed over these sources without inventing facts -- do NOT force one. Respond
 with exactly: {{"decline": true}}
 
 Otherwise respond with strict JSON:
 {{
-  "question": "...",
-  "context": "...",
-  "deliverable": "...",
-  "ground_truth_query": "..."
+  "frame_id": "one_allowed_id"
 }}
 """
 
@@ -910,13 +1203,33 @@ def _realize_is_decline(parsed: Optional[Dict[str, Any]]) -> bool:
         return False
     if parsed.get("decline") in (True, "true", "True"):
         return True
-    q = str(parsed.get("question", "") or "").strip()
+    if str(parsed.get("frame_id", "") or "").strip():
+        return False
+    q = str(parsed.get("question_template", parsed.get("question", "")) or "").strip()
     return q == "" or q.upper() == "NONE"
+
+
+def _source_phrase(path, graph) -> str:
+    names: List[str] = []
+    for uid in dict.fromkeys(getattr(path, "nodes", []) or []):
+        unit = graph.units.get(uid)
+        if not unit:
+            continue
+        name = re.sub(r"\s+", " ", str(unit.title or "")).strip()
+        if name:
+            names.append("`" + name.replace("`", "'") + "`")
+    if len(names) == 1:
+        return names[0]
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    if len(names) > 2:
+        return ", ".join(names[:-1]) + f", and {names[-1]}"
+    return ""
 
 
 def _realize_depgraph(
     path, graph, client: OpenRouterClient, question_type: str,
-    final_anchor: Optional[Anchor] = None,
+    contract: AnswerContract,
 ) -> Optional[Dict[str, Any]]:
     from toffee.generation.depgraph import describe_path
     schema_lines: List[str] = []
@@ -926,19 +1239,14 @@ def _realize_depgraph(
             continue
         cols = ", ".join(c for c, _t, _n in u.sch)
         schema_lines.append(f"  - {u.title}: {cols}")
-    final_step = "(not available)"
-    if final_anchor is not None:
-        header = (final_anchor.r or "").strip().splitlines()
-        final_step = (
-            f"  query: {final_anchor.q_probe}\n"
-            f"  result columns: {header[0] if header else ''}"
-        )
     prompt = _DEPGRAPH_REALIZE_PROMPT.format(
         question_type=question_type,
         op_template=_TYPE_TEMPLATES.get(question_type, ""),
         path_desc=describe_path(path, graph),
-        final_step=final_step,
+        final_step=contract.display_sql,
+        target_clause=contract.target_clause,
         schema_blurb="\n".join(schema_lines),
+        framing_menu=_framing_menu(),
     )
     try:
         from toffee.config import TASK_REALIZE_MODEL
@@ -951,7 +1259,24 @@ def _realize_depgraph(
         return None
     parsed = _parse_llm_json(content)
     if parsed is not None and not _realize_is_decline(parsed):
-        parsed["_question_type"] = question_type
+        frame_id = str(parsed.get("frame_id", "") or "").strip()
+        frame = _FRAMING_OPTIONS.get(frame_id)
+        sources = _source_phrase(path, graph)
+        if frame is None or not sources:
+            return None
+        audience, decision = frame
+        question = (
+            f"For {audience}, {contract.target_clause} using {sources}. "
+            f"The result will support {decision}."
+        )
+        return {
+            "question": question,
+            "context": "",
+            "deliverable": contract.target_clause[:1].upper()
+                           + contract.target_clause[1:] + ".",
+            "_question_type": question_type,
+            "_frame_id": frame_id,
+        }
     return parsed
 
 
@@ -1034,16 +1359,30 @@ def _synthesize_tasks_depgraph(
             continue
 
 
+        contract = _compile_answer_contract(anchors[-1], graph.units)
+        if contract is None:
+            continue
+        key_rows, key_stdout = contract.key_rows, contract.key_stdout
+        if _key_guessable(key_rows):
+            stats["rej_guessable"] += 1
+            continue
+        if not _margin_ok(anchors[-1], key_stdout):
+            stats["rej_margin"] += 1
+            continue
+        if _decoy_reproducible(key_rows, path, graph):
+            stats["rej_decoy"] += 1
+            continue
+
         applicable = _applicable_question_types(path, anchors, graph) or ["verification"]
         question_type = rng.choice(applicable)
-        realized = _realize_depgraph(path, graph, client, question_type, anchors[-1])
+        realized = _realize_depgraph(path, graph, client, question_type, contract)
         if _realize_is_decline(realized):
             remaining = [t for t in applicable if t != question_type]
             if not remaining:
                 stats["rej_decline"] += 1
                 continue
             question_type = rng.choice(remaining)
-            realized = _realize_depgraph(path, graph, client, question_type, anchors[-1])
+            realized = _realize_depgraph(path, graph, client, question_type, contract)
             if _realize_is_decline(realized):
                 stats["rej_decline"] += 1
                 continue
@@ -1053,21 +1392,14 @@ def _synthesize_tasks_depgraph(
         question = str(realized.get("question", "")).strip()
 
 
-        bridge_vals = dg.collect_bridge_values(path)
-        if dg.question_leaks(question, bridge_vals):
+        hidden_vals = dg.collect_bridge_values(path) + _hidden_key_values(key_rows)
+        visible_payload = "\n".join([
+            question,
+            str(realized.get("context", "") or ""),
+            str(realized.get("deliverable", "") or ""),
+        ])
+        if dg.question_leaks(visible_payload, hidden_vals):
             stats["rej_leak"] += 1
-            continue
-
-
-        key_rows, key_stdout = _compile_answer_key(anchors[-1], graph.units)
-        if _key_guessable(key_rows):
-            stats["rej_guessable"] += 1
-            continue
-        if not _margin_ok(anchors[-1], key_stdout):
-            stats["rej_margin"] += 1
-            continue
-        if _decoy_reproducible(key_rows, path, graph):
-            stats["rej_decoy"] += 1
             continue
 
         H = _hierarchy_for_path(path, graph, anchors)
@@ -1081,7 +1413,7 @@ def _synthesize_tasks_depgraph(
             question_type=qtype,
             context=str(realized.get("context", "")).strip(),
             deliverable=str(realized.get("deliverable", "")).strip() or "Provide the analysis result",
-            ground_truth=str(realized.get("ground_truth_query", "")).strip(),
+            ground_truth=contract.query_sql,
             source_span=len(set(path.nodes)) / 3.0,
             format_span=len({graph.units[uid].format for uid in path.nodes
                              if uid in graph.units}) / N_FORMATS,
@@ -1095,14 +1427,24 @@ def _synthesize_tasks_depgraph(
             continue
 
         stats["admitted"] += 1
+        file_sources = [
+            src for src in sources
+            if Path(src).suffix.lower() not in (".sqlite", ".db", ".sqlite3")
+        ]
+        visible_files = list(dict.fromkeys(
+            list(env.get("extra_sources") or []) + file_sources
+        ))
         out.append(SynthesizedTask(
             task_id=f"depgraph_{uuid.uuid4().hex[:8]}",
             question=task.x,
             context=task.context,
             deliverable=task.deliverable,
             env={
-                "db_path": sources[0],
+                "db_path": scratch_db,
                 "data_file": sources[0],
+                "extra_sources": visible_files,
+                "working_dir": str(Path(sources[0]).resolve().parent),
+                "source_files": list(sources),
                 "source_id": source_id,
                 "scratch_db": scratch_db,
             },

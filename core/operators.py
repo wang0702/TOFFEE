@@ -180,7 +180,7 @@ class Operator:
         if task_context:
             question = task_context.get("question", task_context.get("objective", ""))
             env = task_context.get("env", {})
-            db_path_full = env.get("data_file", env.get("db_path", ""))
+            db_path_full = env.get("db_path") or env.get("data_file", "")
 
             db_path = Path(db_path_full).name if db_path_full else ""
 

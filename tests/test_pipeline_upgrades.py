@@ -49,6 +49,35 @@ def test_observable_state_features():
            list(x[:6]) == list(state.feature_vector()[:6]))
 
 
+def test_agent_prompt_uses_scratch_and_keeps_files_visible():
+    from toffee.core.operators import OPERATORS
+
+    task = {
+        "task_id": "scratch-env",
+        "question": "Compare the sources.",
+        "deliverable": "Report every group.",
+        "env": {
+            "db_path": "/tmp/toffee_scratch/env_demo.sqlite",
+            "data_file": "/tmp/original.sqlite",
+            "extra_sources": ["/tmp/notes.md"],
+            "working_dir": "/tmp",
+        },
+    }
+    state = AnalysisState.from_task(task)
+    state.schema_discovered = True
+    prompt = "\n".join(
+        msg["content"] for msg in OPERATORS["SQLDraft"].build_prompt(
+            state, task_context=task,
+        )
+    )
+    _check("agent SQL and Python prompts use the unified scratch database",
+           "DATABASE: env_demo.sqlite" in prompt
+           and "sqlite3.connect('/tmp/toffee_scratch/env_demo.sqlite')" in prompt
+           and "original.sqlite" not in prompt)
+    _check("original documents keep the file-inspection operator enabled",
+           OPERATORS["DataInspect"].is_feasible(state))
+
+
 def test_admission_battery_replay():
     orig = (B._admit_stable, B._admit_accessible, B._admit_nontrivial, B._admit_solvable)
     calls = {"nondeg": 0}
@@ -130,6 +159,7 @@ def test_lcm_pick_for_baselines():
 def main():
     test_execution_metering()
     test_observable_state_features()
+    test_agent_prompt_uses_scratch_and_keeps_files_visible()
     test_admission_battery_replay()
     test_guessable_key_dropped()
     test_baseline_strategy_surface()

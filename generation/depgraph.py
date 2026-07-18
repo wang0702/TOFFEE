@@ -63,7 +63,14 @@ class DepGraph:
             if e.src == node:
                 out.append(e)
             elif e.kind == "join" and e.dst == node:
-                out.append(DepEdge(src=node, dst=e.src, kind="join", meta=e.meta))
+                meta = dict(e.meta)
+                pair = list(meta.get("col_pair") or [])
+                if len(pair) == 2:
+                    meta["col_pair"] = [pair[1], pair[0]]
+                tables = list(meta.get("tables") or [])
+                if len(tables) == 2:
+                    meta["tables"] = [tables[1], tables[0]]
+                out.append(DepEdge(src=node, dst=e.src, kind="join", meta=meta))
         return out
 
 
@@ -278,6 +285,13 @@ def declared_fks(units: List[SourceUnit]) -> Set[Tuple[str, str, str, str, str]]
     for u in units:
         if u.format != "sqlite_table":
             continue
+        recorded = list((u.stat or {}).get("declared_fks") or [])
+        if recorded:
+            for fk in recorded:
+                if fk.get("table") and fk.get("from") and fk.get("to"):
+                    out.add((u.db_path, u.logical_table, str(fk["from"]),
+                             str(fk["table"]), str(fk["to"])))
+            continue
         key = (u.db_path, u.logical_table)
         if key in seen:
             continue
@@ -396,6 +410,7 @@ def _build_join_edges(
             src=u.unit_id, dst=v.unit_id, kind="join",
             meta={
                 "col_pair": [cu, cv],
+                "endpoint_cols": {u.unit_id: cu, v.unit_id: cv},
                 "containment": round(cont, 4),
                 "declared_fk": bool(is_declared),
                 "name_corresponds": _name_corresponds(cu, cv),
@@ -511,12 +526,12 @@ def _build_chain_edges(
              "rej_role": 0}
 
 
-    bridges: Dict[str, Tuple[str, List[str], SourceUnit, str]] = {}
+    bridges: Dict[str, Tuple[str, List[str], SourceUnit, str, Dict[str, Any]]] = {}
     for u in units:
         probe = _bridge_probe(u)
         if not probe:
             continue
-        sql, _meta, bridge_col = probe
+        sql, probe_meta, bridge_col = probe
         res = execute_sql(u.db_path, sql)
         if not res.success:
             continue
@@ -524,11 +539,13 @@ def _build_chain_edges(
         if not vals:
             continue
         stats["probed"] += 1
-        bridges[u.unit_id] = (sql, vals, u, bridge_col)
+        bridges[u.unit_id] = (sql, vals, u, bridge_col, dict(probe_meta))
 
 
-    candidates: List[Tuple[float, SourceUnit, List[str], str, SourceUnit, str, str]] = []
-    for uid, (probe_sql, vals, u, bridge_col) in bridges.items():
+    candidates: List[Tuple[
+        float, SourceUnit, List[str], str, SourceUnit, str, str, Dict[str, Any]
+    ]] = []
+    for uid, (probe_sql, vals, u, bridge_col, probe_meta) in bridges.items():
         bridge_set = set(vals)
         bridge_role = _role_of(u, bridge_col) if bridge_col else "entity"
         for v in units:
@@ -544,14 +561,15 @@ def _build_chain_edges(
                 if ROLE_GATE and not _chain_role_ok(bridge_col, bridge_role, vals, v, cv):
                     stats["rej_role"] += 1
                     continue
-                candidates.append((cont, u, vals, probe_sql, v, cv, bridge_col))
+                candidates.append((cont, u, vals, probe_sql, v, cv,
+                                   bridge_col, probe_meta))
 
 
     candidates.sort(key=lambda c: (not _bridge_is_date_only(c[2]), c[0]), reverse=True)
 
     edges: List[DepEdge] = []
     seen_pairs: Set[Tuple[str, str]] = set()
-    for cont, u, vals, probe_sql, v, cv, bridge_col in candidates:
+    for cont, u, vals, probe_sql, v, cv, bridge_col, probe_meta in candidates:
         if stats["verified"] >= CHAIN_VERIFY_BUDGET:
             break
         pair = (u.unit_id, v.unit_id)
@@ -570,6 +588,7 @@ def _build_chain_edges(
             src=u.unit_id, dst=v.unit_id, kind="chain",
             meta={
                 "probe_sql": probe_sql,
+                "probe_meta": probe_meta,
                 "probe_exec_db": u.db_path,
                 "bridge_values": list(vals),
                 "bridge_col": bridge_col,
@@ -662,20 +681,35 @@ def build_dependency_graph(units: List[SourceUnit], per_env_budget: Optional[int
     )
 
 
+def _composable_continuations(graph: DepGraph, first: DepEdge) -> List[DepEdge]:
+    """Chain edges that consume a result produced over ``first.dst``."""
+    return [
+        edge for edge in graph.out_edges(first.dst)
+        if edge.kind == "chain"
+        and edge.dst not in (first.src, first.dst)
+    ]
+
+
+def _oriented_first_edges(graph: DepGraph) -> List[DepEdge]:
+    edges = list(graph.edges)
+    for edge in graph.edges:
+        if edge.kind == "join":
+            edges.extend(
+                candidate for candidate in graph.out_edges(edge.dst)
+                if candidate.kind == "join" and candidate.dst == edge.src
+            )
+    return edges
+
+
 def supported_levels(graph: DepGraph) -> List[int]:
     levels = [1] if graph.nodes else []
     if graph.edges:
         levels.append(2)
 
 
-        for e in graph.edges:
-            mid = e.dst
-            for o in graph.out_edges(mid):
-                if o.dst == e.src:
-                    continue
-                if e.kind == "chain" or o.kind == "chain":
-                    levels.append(3)
-                    break
+        for e in _oriented_first_edges(graph):
+            if _composable_continuations(graph, e):
+                levels.append(3)
             if 3 in levels:
                 break
     return levels
@@ -693,12 +727,10 @@ def sample_path(graph: DepGraph, level: int, rng: random.Random) -> Optional[Pat
         return Path(level=2, nodes=[e.src, e.dst], edges=[e])
 
 
-    edges = list(graph.edges)
+    edges = _oriented_first_edges(graph)
     rng.shuffle(edges)
     for e1 in edges:
-        conts = [o for o in graph.out_edges(e1.dst) if o.dst not in (e1.src, e1.dst)]
-        if e1.kind != "chain":
-            conts = [o for o in conts if o.kind == "chain"]
+        conts = _composable_continuations(graph, e1)
         if conts:
             e2 = rng.choice(conts)
             return Path(level=3, nodes=[e1.src, e1.dst, e2.dst], edges=[e1, e2])
@@ -758,10 +790,8 @@ def candidate_paths_for_question(
         if e.src in matched or e.dst in matched:
             cand.append((coverage([e.src, e.dst]), -2,
                          Path(level=2, nodes=[e.src, e.dst], edges=[e])))
-    for e1 in graph.edges:
-        for e2 in graph.out_edges(e1.dst):
-            if e2.dst in (e1.src, e1.dst):
-                continue
+    for e1 in _oriented_first_edges(graph):
+        for e2 in _composable_continuations(graph, e1):
             nodes = [e1.src, e1.dst, e2.dst]
             if not (set(nodes) & matched):
                 continue
@@ -789,12 +819,18 @@ def collect_bridge_values(path: Path) -> List[str]:
     return vals
 
 
-def question_leaks(question: str, bridge_values: Sequence[str], min_len: int = 3) -> bool:
+def question_leaks(question: str, bridge_values: Sequence[str], min_len: int = 2) -> bool:
     q = (question or "").lower()
     for b in bridge_values:
         b = str(b).strip()
-        if len(b) >= min_len and b.lower() in q:
-            return True
+        if not b:
+            continue
+        if re.fullmatch(r"-?\d+(?:\.\d+)?", b):
+            if re.search(rf"(?<![\w.]){re.escape(b)}(?![\w.])", q):
+                return True
+        elif len(b) >= min_len:
+            if re.search(rf"(?<!\w){re.escape(b.lower())}(?!\w)", q):
+                return True
     return False
 
 

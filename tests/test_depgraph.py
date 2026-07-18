@@ -85,8 +85,12 @@ def test_bridge_and_leak():
     bridges = ["CHN", "USA", "42"]
     _check("leak detects verbatim",
            D.question_leaks("Which region drove growth in CHN last year?", bridges))
-    _check("leak ignores short values",
-           not D.question_leaks("The answer is 42 units", ["42"]))
+    _check("short numeric bridge still leaks",
+           D.question_leaks("The answer is 42 units", ["42"]))
+    _check("short categorical bridge still leaks",
+           D.question_leaks("Compare EU with other regions", ["EU"]))
+    _check("short bridge uses token boundaries",
+           not D.question_leaks("Summarize business growth", ["US"]))
     _check("no leak when absent",
            not D.question_leaks("Rank regions by growth", bridges))
 
@@ -125,7 +129,7 @@ def test_declared_fk():
                     [(10, 1, 5), (11, 2, 6), (12, 1, 7), (13, 3, 8)])
     con.commit(); con.close()
 
-    from toffee.generation.ingest import ingest_environment
+    from toffee.generation.ingest import ingest_environment, _safe_table_name
     units = ingest_environment([db], os.path.join(d, "scratch.sqlite"))
     fks = D.declared_fks(units)
     _check("declared FK discovered",
@@ -282,6 +286,199 @@ def test_path_admission_pipeline():
     _check("replay passes on live path", B._admit_stable(H, tuple(anchors)))
 
 
+def test_level3_requires_terminal_chain():
+    units = {u: type("U", (), {"title": u})() for u in ("a", "b", "c")}
+    first = DepEdge("a", "b", "chain", {})
+    terminal_join = DepEdge("b", "c", "join", {"col_pair": ["k", "k"]})
+    graph = DepGraph(nodes=list(units), edges=[first, terminal_join], units=units)
+    _check("chain-then-join is not level 3", D.supported_levels(graph) == [1, 2])
+    _check("chain-then-join cannot be sampled",
+           D.sample_path(graph, 3, random.Random(0)) is None)
+
+    reverse_join = DepEdge("b", "a", "join", {
+        "col_pair": ["b_key", "a_key"],
+        "endpoint_cols": {"b": "b_key", "a": "a_key"},
+        "tables": ["b", "a"],
+    })
+    terminal_chain = DepEdge("b", "c", "chain", {})
+    oriented = DepGraph(nodes=list(units), edges=[reverse_join, terminal_chain],
+                        units=units)
+    _check("a reversed join can still feed a terminal chain",
+           3 in D.supported_levels(oriented))
+    sampled = D.sample_path(oriented, 3, random.Random(0))
+    _check("reversed join metadata follows the sampled direction",
+           sampled is not None and sampled.edges[0].src == "a"
+           and sampled.edges[0].meta["col_pair"] == ["a_key", "b_key"])
+
+
+def _composition_fixture(first_kind):
+    import os, sqlite3, tempfile
+    from toffee.generation.ingest import ingest_environment
+    from toffee.generation import bottomup as B
+
+    d = tempfile.mkdtemp(prefix=f"depgraph_l3_{first_kind}_")
+    source = os.path.join(d, "source.sqlite")
+    scratch = os.path.join(d, "scratch.sqlite")
+    con = sqlite3.connect(source)
+    cur = con.cursor()
+    cur.execute("CREATE TABLE seeds(region TEXT)")
+    cur.executemany("INSERT INTO seeds VALUES(?)", [("EU",), ("EU",)])
+    cur.execute("CREATE TABLE orders(region TEXT)")
+    cur.execute("INSERT INTO orders VALUES('EU')")
+    cur.execute("CREATE TABLE marketing(region TEXT, campaign TEXT)")
+    cur.executemany("INSERT INTO marketing VALUES(?,?)",
+                    [("EU", "C1"), ("NA", "C2")])
+    cur.execute("CREATE TABLE returns(campaign TEXT)")
+    cur.executemany("INSERT INTO returns VALUES(?)",
+                    [("C1",), ("C1",), ("C2",), ("C2",), ("C2",)])
+    con.commit(); con.close()
+
+    units = ingest_environment([source], scratch)
+    by_title = {u.title: u for u in units}
+    middle, final = by_title["marketing"], by_title["returns"]
+    terminal = DepEdge(middle.unit_id, final.unit_id, "chain", {
+        "probe_sql": (f'SELECT "campaign", COUNT(*) AS n FROM '
+                      f'"{middle.logical_table}" GROUP BY "campaign" '
+                      f'ORDER BY n DESC LIMIT 8;'),
+        "probe_exec_db": scratch,
+        "bridge_values": ["C1", "C2"],
+        "bridge_col": "campaign",
+        "target_col": "campaign",
+        "probe_meta": {"col_used": ["campaign"]},
+    })
+    if first_kind == "join":
+        start = by_title["orders"]
+        join_sql, exec_db = D._join_sql(start, middle, "region", "region")
+        first = DepEdge(start.unit_id, middle.unit_id, "join", {
+            "join_sql": join_sql, "exec_db": exec_db,
+            "col_pair": ["region", "region"],
+            "endpoint_cols": {start.unit_id: "region", middle.unit_id: "region"},
+            "tables": [start.logical_table, middle.logical_table],
+        })
+    else:
+        start = by_title["seeds"]
+        first = DepEdge(start.unit_id, middle.unit_id, "chain", {
+            "probe_sql": (f'SELECT "region", COUNT(*) AS n FROM '
+                          f'"{start.logical_table}" GROUP BY "region" '
+                          f'ORDER BY n DESC LIMIT 8;'),
+            "probe_exec_db": scratch,
+            "bridge_values": ["EU"],
+            "bridge_col": "region",
+            "target_col": "region",
+            "probe_meta": {"col_used": ["region"]},
+        })
+    graph = DepGraph(
+        nodes=[start.unit_id, middle.unit_id, final.unit_id],
+        edges=[first, terminal], units={u.unit_id: u for u in units},
+    )
+    path = Path(level=3, nodes=list(graph.nodes), edges=[first, terminal])
+    return B, graph, path, scratch
+
+
+def test_join_chain_composition():
+    import sqlite3
+    B, graph, path, scratch = _composition_fixture("join")
+    anchors = B._execute_path(path, graph)
+    _check("join-chain path compiles", anchors is not None)
+    final = anchors[-1]
+    _check("level-3 final anchor reads all sources", final.U_a == path.nodes)
+    _check("level-3 final query is a CTE", final.q_probe.lstrip().upper().startswith("WITH "))
+    _check("upstream join filters terminal bridge",
+           "C1" in final.r and "C2" not in final.r)
+    _check("composed query contains no bridge literals",
+           "'C1'" not in final.q_probe and "'C2'" not in final.q_probe)
+    contract = B._compile_answer_contract(final, graph.units)
+    _check("answer contract comes from composed query",
+           contract is not None and contract.key_rows[0]["label"] == "C1")
+
+    con = sqlite3.connect(scratch)
+    con.execute("INSERT INTO orders VALUES('NA')"); con.commit(); con.close()
+    changed = B._execute_path(path, graph)
+    _check("changing the first source changes the terminal result",
+           changed is not None and "C2" in changed[-1].r)
+
+
+def test_chain_chain_composition():
+    B, graph, path, _scratch = _composition_fixture("chain")
+    anchors = B._execute_path(path, graph)
+    _check("chain-chain path compiles", anchors is not None)
+    _check("chain-chain result consumes the upstream probe",
+           "C1" in anchors[-1].r and "C2" not in anchors[-1].r)
+    _check("source interventions pass during construction",
+           B._level3_source_dependence_ok(path, graph, anchors[-1].r))
+
+
+def test_structured_sources_share_scratch():
+    import csv, os, sqlite3, tempfile
+    from toffee.generation.ingest import ingest_environment, _safe_table_name
+
+    d = tempfile.mkdtemp(prefix="depgraph_scratch_")
+    native = os.path.join(d, "native.sqlite")
+    sheet = os.path.join(d, "extra.csv")
+    scratch = os.path.join(d, "scratch.sqlite")
+    collision_name = _safe_table_name("extra", "csv", sheet)
+    con = sqlite3.connect(native)
+    con.execute("CREATE TABLE native_rows(k TEXT, v INTEGER)")
+    con.execute("INSERT INTO native_rows VALUES('A', 1)")
+    con.execute(
+        "CREATE TABLE semantic(k TEXT COLLATE NOCASE, x INTEGER, "
+        "y INTEGER GENERATED ALWAYS AS (x * 2) STORED)"
+    )
+    con.execute("INSERT INTO semantic(k, x) VALUES('A', 3)")
+    con.execute(f'CREATE TABLE "{collision_name}"(marker TEXT)')
+    con.execute(f'INSERT INTO "{collision_name}" VALUES(\'native\')')
+    con.commit(); con.close()
+    with open(sheet, "w", newline="") as fh:
+        writer = csv.writer(fh); writer.writerow(["k", "v"]); writer.writerow(["A", 2])
+    units = ingest_environment([native, sheet], scratch)
+    _check("all structured units use one scratch database",
+           units and all(u.db_path == scratch for u in units))
+    con = sqlite3.connect(native)
+    source_rows = con.execute("SELECT COUNT(*) FROM native_rows").fetchone()[0]
+    con.close()
+    _check("materialization leaves the source database unchanged", source_rows == 1)
+    con = sqlite3.connect(scratch)
+    tables = {r[0] for r in con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    con.close()
+    _check("scratch contains native and CSV tables",
+           {u.logical_table for u in units}.issubset(tables))
+    by_title = {u.title: u for u in units}
+    semantic = by_title["semantic"]
+    con = sqlite3.connect(scratch)
+    semantic_row = con.execute(
+        f'SELECT COUNT(*), MAX(y) FROM "{semantic.logical_table}" WHERE k = \'a\''
+    ).fetchone()
+    con.close()
+    _check("SQLite collation and generated columns survive materialization",
+           semantic_row == (1, 6))
+    csv_unit = next(u for u in units if u.format == "csv_table")
+    native_collision = by_title[collision_name]
+    _check("cross-format table names never collide",
+           csv_unit.logical_table != native_collision.logical_table)
+    con = sqlite3.connect(scratch)
+    native_marker = con.execute(
+        f'SELECT marker FROM "{native_collision.logical_table}"'
+    ).fetchone()[0]
+    csv_value = con.execute(
+        f'SELECT v FROM "{csv_unit.logical_table}"'
+    ).fetchone()[0]
+    con.close()
+    _check("cross-format collision preserves both sources",
+           native_marker == "native" and csv_value == 2)
+
+    try:
+        ingest_environment([native], native)
+        guarded = False
+    except ValueError:
+        guarded = True
+    _check("source database cannot also be the scratch target", guarded)
+    con = sqlite3.connect(native)
+    source_rows = con.execute("SELECT COUNT(*) FROM native_rows").fetchone()[0]
+    con.close()
+    _check("scratch-path guard preserves the source database", source_rows == 1)
+
+
 def main():
     test_containment()
     test_parse_column_output()
@@ -294,6 +491,10 @@ def main():
     test_candidate_paths()
     test_verify_facts()
     test_path_admission_pipeline()
+    test_level3_requires_terminal_chain()
+    test_join_chain_composition()
+    test_chain_chain_composition()
+    test_structured_sources_share_scratch()
     print("\nAll depgraph unit checks passed.")
 
 

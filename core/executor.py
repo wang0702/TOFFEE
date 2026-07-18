@@ -274,7 +274,11 @@ def execute_tool(tool_name: str, arguments: dict, env_context: Optional[dict] = 
             if tool_name in ("execute_sql", "list_tables", "get_table_schema") and "db_path" not in arguments:
                 arguments = {**arguments, "db_path": env_context["db_path"]}
             if tool_name in ("list_directory", "read_file") and "path" not in arguments:
-                arguments = {**arguments, "path": os.path.dirname(env_context["db_path"])}
+                default_path = (
+                    env_context.get("working_dir")
+                    or os.path.dirname(env_context["db_path"])
+                )
+                arguments = {**arguments, "path": default_path}
 
 
         if tool_name in _SANDBOXED_TOOLS and "working_dir" not in arguments:

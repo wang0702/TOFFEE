@@ -321,7 +321,8 @@ def test_family_preconditions():
     two_groups = _anchor("grp    val   \n-----  -----\nA      5     \nB      9     \n")
     types2 = B._applicable_question_types(_P1(), [two_groups], _G())
     _check("comparison applies to a multi-group measure", "comparison" in types2)
-    _check("anomaly applies when dispersion is nonzero", "anomaly" in types2)
+    _check("unsupported derived families are not invented",
+           not ({"anomaly", "diagnosis", "data_quality"} & set(types2)))
 
 
 def test_teacher_decline_parse():
@@ -331,6 +332,80 @@ def test_teacher_decline_parse():
     _check("a real question is not a decline",
            not B._realize_is_decline({"question": "What drove the gap?"}))
     _check("no parse is not a decline", not B._realize_is_decline(None))
+
+
+def test_teacher_prompt_is_value_blind_and_target_fixed():
+    import json
+    from toffee.generation.depgraph import DepGraph, Path
+
+    secret = "SECRET_BRIDGE_7"
+    raw_sql = (f"SELECT region, COUNT(*) FROM returns "
+               f"WHERE region IN ('{secret}') AND score > 17")
+    display = B._teacher_sql_view(raw_sql)
+    _check("teacher SQL view removes string and numeric literals",
+           secret not in display and "17" not in display)
+
+    unit = type("U", (), {
+        "title": "returns", "logical_table": "returns",
+        "sch": [("region", "TEXT", True)],
+    })()
+    graph = DepGraph(nodes=["u"], edges=[], units={"u": unit})
+    path = Path(level=1, nodes=["u"], edges=[])
+    contract = B.AnswerContract(
+        exec_db="/private/environment.sqlite",
+        query_sql=raw_sql,
+        display_sql=display,
+        target_clause="report the return count for every region",
+        key_rows=[{"label": "EU", "value": 4.0, "raw": "EU 4"}],
+        key_stdout="EU 4",
+        required_units=["u"],
+    )
+
+    class CaptureClient:
+        prompt = ""
+
+        def call(self, messages, **kw):
+            self.prompt = messages[0]["content"]
+            return json.dumps({
+                "frame_id": "operations_planning",
+                "question_template": "Explain why revenue fell.",
+                "context": "After a 17% decline, review customer ID.",
+                "ground_truth_query": "SELECT 999",
+            }), {}
+
+    client = CaptureClient()
+    realized = B._realize_depgraph(path, graph, client, "verification", contract)
+    _check("realizer executes without a format placeholder error", realized is not None)
+    _check("teacher prompt contains no bridge or database value",
+           secret not in client.prompt and "17" not in client.prompt
+           and "/private/" not in client.prompt)
+    _check("system inserts the immutable target",
+           realized["question"] ==
+           "For the operations team, report the return count for every region "
+           "using `returns`. The result will support operational planning.")
+    _check("teacher cannot replace the executable truth",
+           contract.query_sql == raw_sql and "ground_truth_query" not in realized)
+    _check("free-form teacher text is never exported",
+           realized["context"] == "" and "17" not in realized["question"]
+           and "customer" not in realized["question"].lower())
+
+    class FreeformClient:
+        def call(self, messages, **kw):
+            return json.dumps({"question_template": "Report revenue."}), {}
+
+    _check("free-form question output is rejected",
+           B._realize_depgraph(path, graph, FreeformClient(),
+                               "verification", contract) is None)
+
+    class UnknownFrameClient:
+        def call(self, messages, **kw):
+            return json.dumps({"frame_id": "customer_id_review"}), {}
+
+    _check("teacher must select an allowed frame",
+           B._realize_depgraph(path, graph, UnknownFrameClient(),
+                               "verification", contract) is None)
+    _check("a valid frame id is not treated as a decline",
+           not B._realize_is_decline({"frame_id": "operations_planning"}))
 
 
 def test_contract_compilation_from_stdout():
@@ -343,6 +418,63 @@ def test_contract_compilation_from_stdout():
            == f"SELECT x FROM t ORDER BY x LIMIT {B._KEY_ROW_CAP}")
     _check("no LIMIT left untouched",
            B._strip_row_cap("SELECT x FROM t") == "SELECT x FROM t")
+    three_cols = ("region  channel  n\n"
+                  "------  -------  -\n"
+                  "EU      web      4\n")
+    _check("ambiguous three-column contract is rejected",
+           B._key_rows_from_stdout(three_cols) == [])
+    hidden = B._hidden_key_values([
+        {"label": "EU", "value": 4.0},
+        {"label": "NA", "value": 2.5},
+    ])
+    _check("answer labels and numeric spellings are hidden",
+           {"EU", "NA", "4.0", "4", "2.5"}.issubset(set(hidden)))
+
+
+def test_stable_replays_the_full_answer_query():
+    import os
+    import sqlite3
+    import tempfile
+    from toffee.generation.ingest import SourceUnit
+
+    work = tempfile.mkdtemp(prefix="toffee_full_replay_")
+    db_path = os.path.join(work, "env.sqlite")
+    con = sqlite3.connect(db_path)
+    con.execute("CREATE TABLE metrics(id INTEGER)")
+    con.executemany("INSERT INTO metrics VALUES(?)", [(i,) for i in range(1, 26)])
+    con.commit(); con.close()
+
+    unit = SourceUnit(
+        unit_id="u", format="sqlite_table", title="metrics",
+        logical_table="metrics", origin_path=db_path,
+        origin_locator=db_path + "::metrics", db_path=db_path,
+        sch=[("id", "INTEGER", True)],
+    )
+    units = {"u": unit}
+    preview = ("SELECT printf('r%02d', id) AS label, id AS value "
+               "FROM metrics ORDER BY id LIMIT 20")
+    full = ("SELECT printf('r%02d', id) AS label, id AS value "
+            "FROM metrics ORDER BY id")
+    anchor = B._mk_path_anchor(
+        preview, db_path, ["u"], "probe", units,
+        answer_sql=full, target_clause="report every metric value",
+    )
+    _check("answer replay fixture executes", anchor is not None)
+    contract = B._compile_answer_contract(anchor, units)
+    _check("full answer query becomes the stable replay", contract is not None
+           and anchor.c.get("stable_sql") == full)
+    hierarchy = B.Hierarchy(
+        units=units,
+        scopes={"g00": B.Scope(scope_id="g00", units=["u"])},
+        anchors={anchor.a_id: anchor},
+    )
+    _check("unchanged full result is stable", B._admit_stable(hierarchy, (anchor,)))
+
+    con = sqlite3.connect(db_path)
+    con.execute("INSERT INTO metrics VALUES(100)")
+    con.commit(); con.close()
+    _check("change beyond preview limit still fails Stable",
+           not B._admit_stable(hierarchy, (anchor,)))
 
 
 def test_answer_extraction_unified():
@@ -505,7 +637,9 @@ def main():
     test_margin_gate()
     test_family_preconditions()
     test_teacher_decline_parse()
+    test_teacher_prompt_is_value_blind_and_target_fixed()
     test_contract_compilation_from_stdout()
+    test_stable_replays_the_full_answer_query()
     test_nondeg_fail_closed()
     test_hint_is_sources_only()
     test_answer_extraction_unified()

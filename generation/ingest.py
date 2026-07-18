@@ -8,7 +8,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from toffee.core.executor import execute_sql, list_tables
 
@@ -131,8 +131,11 @@ def _profile_sqlite_table(db_path: str, table: str) -> Tuple[
     conn.set_progress_handler(lambda: 1 if _t.monotonic() > _deadline else 0, 100_000)
     try:
         cur = conn.cursor()
-        cur.execute(f'PRAGMA table_info("{table}");')
-        pragma = cur.fetchall()
+        cur.execute(f'PRAGMA table_xinfo("{table}");')
+        pragma = [
+            row for row in cur.fetchall()
+            if len(row) < 7 or int(row[6] or 0) != 1
+        ]
         sch: List[Tuple[str, str, bool]] = [
             (row[1], row[2] or "", not bool(row[3])) for row in pragma
         ]
@@ -249,28 +252,158 @@ def _safe_table_name(stem: str, kind: str, *parts: str) -> str:
     return f"{base}_{_uid(kind, *parts)[:6]}"
 
 
-def _ingest_sqlite(db_path: str, scratch_db: str) -> List[SourceUnit]:
+def _qident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+_CREATE_TABLE_HEAD = re.compile(
+    r'^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+    r'(?:(?:"(?:[^"]|"")*")|(?:`[^`]*`)|(?:\[[^\]]*\])|(?:[^\s(]+))',
+    re.IGNORECASE,
+)
+
+
+def _copy_sqlite_table(
+    db_path: str, source_table: str, scratch_db: str, target_table: str,
+) -> bool:
+    """Copy one native SQLite table into the environment scratch database.
+
+    Task construction and trajectory search must query the same database.  In
+    particular, a path may combine a native SQLite table with a CSV, sheet, or
+    Markdown table that already lives in ``scratch_db``.  Copying the native
+    table once at ingestion gives every later component one stable namespace.
+    """
+    conn = sqlite3.connect(scratch_db)
+    try:
+        conn.execute("ATTACH DATABASE ? AS source_db", (db_path,))
+        pragma = conn.execute(
+            f"PRAGMA source_db.table_xinfo({_qident(source_table)})"
+        ).fetchall()
+        if not pragma:
+            return False
+        materialized = [
+            row for row in pragma
+            if len(row) < 7 or int(row[6] or 0) != 1
+        ]
+        inserted = [
+            row for row in materialized
+            if len(row) < 7 or int(row[6] or 0) == 0
+        ]
+        ddl_row = conn.execute(
+            "SELECT type, sql FROM source_db.sqlite_master WHERE name = ?",
+            (source_table,),
+        ).fetchone()
+        conn.execute(f"DROP TABLE IF EXISTS main.{_qident(target_table)}")
+        copied_ddl = False
+        if ddl_row and ddl_row[0] == "table" and ddl_row[1]:
+            rewritten, n_sub = _CREATE_TABLE_HEAD.subn(
+                f"CREATE TABLE main.{_qident(target_table)}",
+                str(ddl_row[1]), count=1,
+            )
+            if n_sub == 1:
+                try:
+                    conn.execute(rewritten)
+                    copied_ddl = True
+                except sqlite3.Error as exc:
+                    log.debug("DDL copy failed for %s::%s; materializing values: %s",
+                              db_path, source_table, exc)
+        if not copied_ddl:
+            col_defs: List[str] = []
+            for row in materialized:
+                col = str(row[1])
+                typ = str(row[2] or "")
+                not_null = " NOT NULL" if bool(row[3]) else ""
+                col_defs.append(f"{_qident(col)} {typ}{not_null}".strip())
+            conn.execute(
+                f"CREATE TABLE main.{_qident(target_table)} ({', '.join(col_defs)})"
+            )
+            inserted = materialized
+        cols = [_qident(str(row[1])) for row in inserted]
+        if not cols:
+            return False
+        col_list = ", ".join(cols)
+        conn.execute(
+            f"INSERT INTO main.{_qident(target_table)} ({col_list}) "
+            f"SELECT {col_list} FROM source_db.{_qident(source_table)}"
+        )
+        conn.commit()
+        return True
+    except Exception as exc:
+        try:
+            conn.execute(f"DROP TABLE IF EXISTS main.{_qident(target_table)}")
+            conn.commit()
+        except Exception:
+            pass
+        log.warning("SQLite materialization failed for %s::%s: %s",
+                    db_path, source_table, exc)
+        return False
+    finally:
+        try:
+            conn.execute("DETACH DATABASE source_db")
+        except Exception:
+            pass
+        conn.close()
+
+
+def _source_foreign_keys(db_path: str, table: str) -> List[Dict[str, str]]:
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                f"PRAGMA foreign_key_list({_qident(table)})"
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        return []
+    return [
+        {"table": str(r[2]), "from": str(r[3]), "to": str(r[4])}
+        for r in rows if len(r) >= 5 and r[2] and r[3] and r[4]
+    ]
+
+
+def _ingest_sqlite(
+    db_path: str, scratch_db: str, used_tables: Optional[Set[str]] = None,
+) -> List[SourceUnit]:
     result = list_tables(db_path)
     if not result.success:
         return []
     tables = [t.strip() for t in result.stdout.split() if t.strip()]
+    used_tables = used_tables if used_tables is not None else set()
+
+    # Allocate every destination name before copying so foreign-key targets can
+    # be remapped consistently when two database files contain the same table.
+    table_map: Dict[str, str] = {}
+    for tbl in tables[:40]:
+        target = _reserve_table_name(
+            tbl, used_tables, "sqlite", db_path, tbl,
+        )
+        table_map[tbl] = target
+
     units: List[SourceUnit] = []
     for tbl in tables[:40]:
+        target = table_map[tbl]
+        if not _copy_sqlite_table(db_path, tbl, scratch_db, target):
+            continue
         try:
-            sch, stat, key, ent = _profile_sqlite_table(db_path, tbl)
+            sch, stat, key, ent = _profile_sqlite_table(scratch_db, target)
         except Exception as exc:
             log.warning("Profile failed for %s :: %s : %s", db_path, tbl, exc)
             continue
         if not sch:
             continue
+        stat["declared_fks"] = [
+            {**fk, "table": table_map.get(fk["table"], fk["table"])}
+            for fk in _source_foreign_keys(db_path, tbl)
+        ]
         units.append(SourceUnit(
             unit_id=_uid("sqlite_table", db_path, tbl),
             format="sqlite_table",
             title=tbl,
-            logical_table=tbl,
+            logical_table=target,
             origin_path=db_path,
             origin_locator=f"{db_path}::{tbl}",
-            db_path=db_path,
+            db_path=scratch_db,
             sch=sch, stat=stat, key=key, ent=ent,
             scratch_db_path=scratch_db,
         ))
@@ -280,6 +413,24 @@ def _ingest_sqlite(db_path: str, scratch_db: str) -> List[SourceUnit]:
 def _safe_ident(name: str) -> str:
     ident = re.sub(r"[^A-Za-z0-9_]", "_", name or "")
     return ident or "col"
+
+
+def _reserve_table_name(
+    proposed: str, used_tables: Set[str], kind: str, *parts: str,
+) -> str:
+    used_lower = {name.lower() for name in used_tables}
+    target = proposed
+    if target.lower() in used_lower:
+        target = _safe_table_name(
+            f"{proposed}_{kind}", f"{kind}_collision", *parts,
+        )
+        base = target
+        suffix = 1
+        while target.lower() in used_lower:
+            target = f"{base}_{suffix}"
+            suffix += 1
+    used_tables.add(target)
+    return target
 
 
 def _coerce_sqlite_type(values: List[str]) -> str:
@@ -360,7 +511,9 @@ def _materialize_rows_into_sqlite(
     return sch, len(normalized)
 
 
-def _ingest_csv(file_path: str, scratch_db: str) -> List[SourceUnit]:
+def _ingest_csv(
+    file_path: str, scratch_db: str, used_tables: Optional[Set[str]] = None,
+) -> List[SourceUnit]:
     p = Path(file_path)
     if not p.is_file():
         return []
@@ -375,7 +528,11 @@ def _ingest_csv(file_path: str, scratch_db: str) -> List[SourceUnit]:
     if len(rows) < 2:
         return []
     header, data = rows[0], rows[1:]
-    table = _safe_table_name(p.stem, "csv", file_path)
+    used_tables = used_tables if used_tables is not None else set()
+    table = _reserve_table_name(
+        _safe_table_name(p.stem, "csv", file_path),
+        used_tables, "csv", file_path,
+    )
     sch, n_rows = _materialize_rows_into_sqlite(scratch_db, table, header, data)
     if not sch:
         return []
@@ -393,7 +550,9 @@ def _ingest_csv(file_path: str, scratch_db: str) -> List[SourceUnit]:
     )]
 
 
-def _ingest_excel(file_path: str, scratch_db: str) -> List[SourceUnit]:
+def _ingest_excel(
+    file_path: str, scratch_db: str, used_tables: Optional[Set[str]] = None,
+) -> List[SourceUnit]:
     p = Path(file_path)
     if not p.is_file():
         return []
@@ -408,6 +567,7 @@ def _ingest_excel(file_path: str, scratch_db: str) -> List[SourceUnit]:
         return []
 
     units: List[SourceUnit] = []
+    used_tables = used_tables if used_tables is not None else set()
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
         all_rows = [[cell for cell in row] for row in ws.iter_rows(values_only=True)]
@@ -417,7 +577,12 @@ def _ingest_excel(file_path: str, scratch_db: str) -> List[SourceUnit]:
             continue
         header = [str(c) if c is not None else "col" for c in all_rows[0]]
         data = [list(r) for r in all_rows[1:]]
-        table = _safe_table_name(f"{p.stem}_{sheet_name}", "xlsx", file_path, sheet_name)
+        table = _reserve_table_name(
+            _safe_table_name(
+                f"{p.stem}_{sheet_name}", "xlsx", file_path, sheet_name,
+            ),
+            used_tables, "xlsx", file_path, sheet_name,
+        )
         sch, n_rows = _materialize_rows_into_sqlite(scratch_db, table, header, data)
         if not sch:
             continue
@@ -519,7 +684,9 @@ def _extract_md_kv_blocks(text: str) -> List[Tuple[List[str], List[List[str]]]]:
     return out
 
 
-def _ingest_md(file_path: str, scratch_db: str) -> List[SourceUnit]:
+def _ingest_md(
+    file_path: str, scratch_db: str, used_tables: Optional[Set[str]] = None,
+) -> List[SourceUnit]:
     p = Path(file_path)
     if not p.is_file():
         return []
@@ -530,8 +697,12 @@ def _ingest_md(file_path: str, scratch_db: str) -> List[SourceUnit]:
         return []
     blocks = _extract_md_pipe_tables(text) + _extract_md_kv_blocks(text)
     units: List[SourceUnit] = []
+    used_tables = used_tables if used_tables is not None else set()
     for idx, (header, data) in enumerate(blocks):
-        table = _safe_table_name(f"{p.stem}_{idx}", "md", file_path, str(idx))
+        table = _reserve_table_name(
+            _safe_table_name(f"{p.stem}_{idx}", "md", file_path, str(idx)),
+            used_tables, "md", file_path, str(idx),
+        )
         sch, n_rows = _materialize_rows_into_sqlite(scratch_db, table, header, data)
         if not sch:
             continue
@@ -563,26 +734,71 @@ def _detect_family(path: str) -> Optional[str]:
     return None
 
 
+_SCRATCH_APP_ID = 0x544F4646  # "TOFF"
+
+
+def _owned_scratch(path: Path) -> bool:
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            row = conn.execute("PRAGMA application_id").fetchone()
+            return bool(row and int(row[0]) == _SCRATCH_APP_ID)
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def _managed_scratch_location(path: Path) -> bool:
+    return (
+        path.name.startswith("env_")
+        and path.parent.name in {".toffee_scratch", "toffee_scratch"}
+    )
+
+
 def ingest_environment(env_sources: List[str], scratch_db: str) -> List[SourceUnit]:
     scratch_parent = Path(scratch_db).parent
     scratch_parent.mkdir(parents=True, exist_ok=True)
 
-    sqlite3.connect(scratch_db).close()
+    scratch_path = Path(scratch_db)
+    source_paths = set()
+    for src in env_sources:
+        try:
+            source_paths.add(Path(src).resolve())
+        except Exception:
+            continue
+    if scratch_path.resolve() in source_paths:
+        raise ValueError("scratch_db must be different from every source database")
+    if scratch_path.exists():
+        if not _owned_scratch(scratch_path) and not _managed_scratch_location(scratch_path):
+            raise ValueError("refusing to replace a scratch database not owned by TOFFEE")
+        scratch_path.unlink()
+    scratch_conn = sqlite3.connect(scratch_db)
+    try:
+        scratch_conn.execute(f"PRAGMA application_id = {_SCRATCH_APP_ID}")
+        scratch_conn.commit()
+    finally:
+        scratch_conn.close()
 
     units: List[SourceUnit] = []
+    used_tables: Set[str] = set()
     for src in env_sources:
         fam = _detect_family(src)
         if fam is None:
             log.debug("Skipping unrecognized source %s", src)
             continue
         if fam == "sqlite_table":
-            units.extend(_ingest_sqlite(src, scratch_db))
+            new_units = _ingest_sqlite(src, scratch_db, used_tables)
+            units.extend(new_units)
         elif fam == "csv_table":
-            units.extend(_ingest_csv(src, scratch_db))
+            new_units = _ingest_csv(src, scratch_db, used_tables)
+            units.extend(new_units)
         elif fam == "excel_sheet":
-            units.extend(_ingest_excel(src, scratch_db))
+            new_units = _ingest_excel(src, scratch_db, used_tables)
+            units.extend(new_units)
         elif fam == "md_struct":
-            units.extend(_ingest_md(src, scratch_db))
+            new_units = _ingest_md(src, scratch_db, used_tables)
+            units.extend(new_units)
     return units
 
 
